@@ -1,0 +1,335 @@
+text plz here 
+
+
+
+
+
+
+
+
+-- BLDC position & velocity estimation from 3 Hall sensors (A,B,C)
+-- Features:
+--  * 2-FF sync + glitch filter on halls
+--  * sector decode (6-step), direction detection
+--  * edge-to-edge period timing
+--  * RPM = (FCLK*60)/(6*P*period_counts)
+--  * Electrical angle = sector*1024 + frac*1024 (Q10; 0..6143 ≙ 0..360°)
+--  * Simple EMA filter on RPM (shift-based)
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity bldc_hall_estimator is
+  generic (
+    F_CLK_HZ      : natural := 100_000_000; -- system clock (Hz)
+    POLE_PAIRS    : natural := 4;           -- BLDC pole pairs
+    FILTER_LEN    : natural := 8;           -- consecutive equal samples to accept a Hall level (>=2)
+    RPM_EMA_SHIFT : natural := 3            -- EMA alpha = 1/2^SHIFT (e.g., 3 -> 1/8)
+  );
+  port (
+    clk        : in  std_logic;
+    rst_n      : in  std_logic;
+
+    hall_a_in  : in  std_logic;
+    hall_b_in  : in  std_logic;
+    hall_c_in  : in  std_logic;
+
+    -- Outputs
+    sector     : out unsigned(2 downto 0);  -- 0..5 valid; 7 on fault
+    dir_ccw    : out std_logic;             -- '1' if CCW, '0' if CW (convention set by map below)
+    elec_q10   : out unsigned(12 downto 0); -- 0..6143 (6*1024-1)
+    rpm        : out unsigned(31 downto 0); -- filtered RPM (integer)
+    valid      : out std_logic              -- '1' once first valid edge captured
+  );
+end entity;
+
+architecture rtl of bldc_hall_estimator is
+
+  ---------------------------------------------------------------------------
+  -- Synchronizers and glitch filter
+  ---------------------------------------------------------------------------
+  function to_slv(b: boolean) return std_logic is
+  begin
+    if b then return '1'; else return '0'; end if;
+  end;
+
+  -- 2-FF sync
+  signal ha_ff1, ha_ff2 : std_logic := '0';
+  signal hb_ff1, hb_ff2 : std_logic := '0';
+  signal hc_ff1, hc_ff2 : std_logic := '0';
+
+  -- Glitch filter (N consecutive samples)
+  signal ha_f, hb_f, hc_f : std_logic := '0';
+  signal ha_cnt, hb_cnt, hc_cnt : unsigned(7 downto 0) := (others=>'0'); -- supports up to 255
+
+  -- Sector / code
+  signal hall_code    : unsigned(2 downto 0);
+  signal sector_cur   : unsigned(2 downto 0) := (others=>'1'); -- 7 = invalid
+  signal sector_prev  : unsigned(2 downto 0) := (others=>'1');
+
+  -- Edge detection (sector changes)
+  signal sector_change : std_logic := '0';
+
+  -- Direction via allowed 6-step sequence (CW order: 0,1,2,3,4,5 then wrap)
+  -- We’ll define a lookup for sector from (A,B,C), and use prev->cur step to infer direction
+  type sector_lut_t is array (0 to 7) of integer range -1 to 5; -- -1 => invalid
+  constant SECTOR_LUT : sector_lut_t := (
+    -- abc = 000..111 (binary index)
+    -- Map (typical 120° spaced Hall): 001->0, 101->1, 100->2, 110->3, 010->4, 011->5
+      -1,  -- 000 invalid
+       0,  -- 001
+      4,   -- 010
+      5,   -- 011
+      2,   -- 100
+      1,   -- 101
+      3,   -- 110
+      -1   -- 111 invalid
+  );
+
+  signal dir_ccw_i : std_logic := '0';
+
+  -- Timing for velocity & interpolation
+  signal tick_counter     : unsigned(31 downto 0) := (others=>'0'); -- free-running
+  signal t_last_edge      : unsigned(31 downto 0) := (others=>'0');
+  signal period_counts    : unsigned(31 downto 0) := (others=>'0'); -- between sector changes
+  signal period_valid     : std_logic := '0';
+
+  -- Interpolation inside 60° sector
+  signal ticks_since      : unsigned(31 downto 0) := (others=>'0');
+
+  -- K = (F_CLK_HZ*60)/(6*POLE_PAIRS) = (F_CLK_HZ*10)/POLE_PAIRS
+  constant K_RPM_NUM      : natural := F_CLK_HZ*10;  -- exact same as above derivation
+  -- rpm = (K_RPM_NUM / POLE_PAIRS) / period_counts
+  -- We'll compute KdivP at elaboration (natural fits 32-bit if F_CLK_HZ up to 200MHz comfortably)
+  constant KdivP          : natural := K_RPM_NUM / POLE_PAIRS;
+
+  signal rpm_inst         : unsigned(31 downto 0) := (others=>'0');
+  signal rpm_filt         : unsigned(31 downto 0) := (others=>'0');
+
+  signal valid_i          : std_logic := '0';
+
+  -- Angle accumulator (Q10: 0..6143)
+  signal elec_q10_i       : unsigned(12 downto 0) := (others=>'0');
+
+
+-- Helpers
+  function min_u32(a,b: unsigned(31 downto 0)) return unsigned is
+  begin
+    if a < b then return a; else return b; end if;
+  end;
+
+begin
+
+  ---------------------------------------------------------------------------
+  -- 2-FF synchronizers
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      ha_ff1 <= hall_a_in; ha_ff2 <= ha_ff1;
+      hb_ff1 <= hall_b_in; hb_ff2 <= hb_ff1;
+      hc_ff1 <= hall_c_in; hc_ff2 <= hc_ff1;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Simple glitch filter: require FILTER_LEN consecutive equal samples
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+  begin
+    if rst_n = '0' then
+      ha_f <= '0'; hb_f <= '0'; hc_f <= '0';
+      ha_cnt <= (others=>'0'); hb_cnt <= (others=>'0'); hc_cnt <= (others=>'0');
+    elsif rising_edge(clk) then
+      -- A
+      if ha_ff2 = ha_f then
+        ha_cnt <= (others=>'0');
+      else
+        if ha_cnt = to_unsigned(FILTER_LEN-1, ha_cnt'length) then
+          ha_f <= ha_ff2; ha_cnt <= (others=>'0');
+        else
+          ha_cnt <= ha_cnt + 1;
+        end if;
+      end if;
+      -- B
+      if hb_ff2 = hb_f then
+        hb_cnt <= (others=>'0');
+      else
+        if hb_cnt = to_unsigned(FILTER_LEN-1, hb_cnt'length) then
+          hb_f <= hb_ff2; hb_cnt <= (others=>'0');
+        else
+          hb_cnt <= hb_cnt + 1;
+        end if;
+      end if;
+      -- C
+      if hc_ff2 = hc_f then
+        hc_cnt <= (others=>'0');
+      else
+        if hc_cnt = to_unsigned(FILTER_LEN-1, hc_cnt'length) then
+          hc_f <= hc_ff2; hc_cnt <= (others=>'0');
+        else
+          hc_cnt <= hc_cnt + 1;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  hall_code <= unsigned(ha_f & hb_f & hc_f);
+
+  ---------------------------------------------------------------------------
+  -- Sector decode + direction from prev->cur transition
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+    variable s_int : integer;
+  begin
+    if rst_n = '0' then
+      sector_cur   <= (others=>'1'); -- 7 invalid
+      sector_prev  <= (others=>'1');
+      sector_change <= '0';
+      dir_ccw_i    <= '0';
+    elsif rising_edge(clk) then
+      sector_change <= '0';
+      s_int := SECTOR_LUT(to_integer(hall_code));
+      if s_int = -1 then
+        -- invalid code, keep previous sector
+        sector_cur <= (others=>'1'); -- mark invalid
+      else
+        if sector_cur /= to_unsigned(s_int,3) then
+          sector_prev  <= sector_cur;
+          sector_cur   <= to_unsigned(s_int,3);
+          sector_change <= '1';
+          -- Determine direction using 6-step ring
+          -- CW sequence example: 0->1->2->3->4->5->0 (dir_ccw='0')
+          -- CCW sequence: reverse order (dir_ccw='1')
+          if sector_prev /= "111" then
+            -- compute delta = (cur - prev) mod 6
+            -- Map to small arithmetic:
+            variable cur_i  : integer := s_int;
+            variable prev_i : integer := to_integer(sector_prev);
+            variable d      : integer := (cur_i - prev_i + 6) mod 6;
+            -- d=1 => CW, d=5 => CCW; other jumps may be noise or missed step; keep last dir
+            if d = 1 then
+              dir_ccw_i <= '0';
+            elsif d = 5 then
+              dir_ccw_i <= '1';
+            end if;
+          end if;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Timebase
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+  begin
+    if rst_n = '0' then
+      tick_counter <= (others=>'0');
+    elsif rising_edge(clk) then
+      tick_counter <= tick_counter + 1;
+    end if;
+  end process;
+
+
+
+
+
+
+---------------------------------------------------------------------------
+  -- Period measurement between sector changes (edge-to-edge)
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+    variable per : unsigned(31 downto 0);
+  begin
+    if rst_n = '0' then
+      t_last_edge   <= (others=>'0');
+      period_counts <= (others=>'0');
+      period_valid  <= '0';
+      valid_i       <= '0';
+    elsif rising_edge(clk) then
+      if sector_change = '1' and sector_cur /= "111" then
+        per := tick_counter - t_last_edge;
+        t_last_edge   <= tick_counter;
+        -- Simple clamp to avoid div-by-zero and ridiculous values
+        if per = (others=>'0') then
+          period_counts <= to_unsigned(1,32);
+        else
+          period_counts <= per;
+        end if;
+        period_valid  <= '1';
+        valid_i       <= '1';
+      else
+        period_valid  <= '0';
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Instantaneous RPM = (KdivP) / period_counts, KdivP=(Fclk*10)/P => equals (Fclk*60)/(6*P)
+  -- Then EMA filter: rpm_filt += (rpm_inst - rpm_filt)/2^RPM_EMA_SHIFT
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+    variable div_q : unsigned(31 downto 0);
+    constant K_CONST : unsigned(31 downto 0) := to_unsigned(KdivP,32);
+    variable diff   : signed(32 downto 0);
+  begin
+    if rst_n = '0' then
+      rpm_inst <= (others=>'0');
+      rpm_filt <= (others=>'0');
+    elsif rising_edge(clk) then
+      if period_valid = '1' then
+        -- Unsigned division; synthesizable in most tools (or replace with divider IP if needed)
+        div_q := K_CONST / period_counts;
+        rpm_inst <= div_q;
+
+        -- EMA filtering (signed math to handle diff)
+        diff := signed(('0' & rpm_inst)) - signed(('0' & rpm_filt));
+        rpm_filt <= unsigned( signed(rpm_filt) + (diff sra RPM_EMA_SHIFT) );
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Angle interpolation: within each 60° sector, fraction = ticks_since / period_counts
+  -- Electrical angle Q10 = sector*1024 + frac*1024, wrap to 0..6143
+  ---------------------------------------------------------------------------
+  process(clk, rst_n)
+    variable base_q10 : unsigned(12 downto 0);
+    variable frac_q10 : unsigned(12 downto 0);
+    variable num      : unsigned(31 downto 0);
+    variable q        : unsigned(31 downto 0);
+    variable s_i      : integer;
+  begin
+    if rst_n = '0' then
+      ticks_since <= (others=>'0');
+      elec_q10_i  <= (others=>'0');
+    elsif rising_edge(clk) then
+      -- ticks since last edge
+      ticks_since <= tick_counter - t_last_edge;
+
+      -- Compute only if sector is valid and we have a nonzero period
+      s_i := SECTOR_LUT(to_integer(hall_code));
+      if (s_i /= -1) and (period_counts /= to_unsigned(0,32)) then
+        base_q10 := to_unsigned(s_i*1024, 13);
+        -- frac_q10 = (ticks_since * 1024) / period_counts
+        num := ticks_since * to_unsigned(1024,32);
+        q   := num / period_counts; -- 0..1024
+        if q > to_unsigned(1023,32) then
+          q := to_unsigned(1023,32); -- clamp
+        end if;
+        frac_q10 := resize(q, 13);
+        elec_q10_i <= base_q10 + frac_q10; -- auto wraps at sector boundary
+      end if;
+    end if;
+  end process;
+
+  -- Drive outputs
+  sector   <= sector_cur;
+  dir_ccw  <= dir_ccw_i;
+  elec_q10 <= elec_q10_i;
+  rpm      <= rpm_filt;
+  valid    <= valid_i;
+
+end architecture;
