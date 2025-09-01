@@ -1,0 +1,334 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+
+
+
+
+entity bldc_sector_timers is
+  generic (
+    SECTOR_CNT_WIDTH : integer := 24;  -- sector timer counter width (clock cycles per 60°)
+    ROT_CNT_WIDTH    : integer := 28;  -- rotation timer counter width (clock cycles per 360°)
+    POS_WIDTH        : integer := 32   -- position up/down counter width
+  );
+  port (
+    clk   : in  std_logic;
+    rst_n : in  std_logic;  -- active-low synchronous reset
+
+    -- 3 Hall inputs (asynchronous from motor)
+    hall_in : in  std_logic_vector(2 downto 0);
+
+    -- Outputs
+    sector              : out unsigned(2 downto 0);  -- 0..5
+    sector_valid        : out std_logic;             -- '1' if hall pattern valid
+    direction           : out std_logic;             -- '1' = CW, '0' = CCW, undefined if no movement yet
+    position_count      : out signed(POS_WIDTH-1 downto 0); -- +/- steps (one per sector transition)
+
+    sector_timer        : out unsigned(SECTOR_CNT_WIDTH-1 downto 0); -- running time in current sector
+    last_sector_time    : out unsigned(SECTOR_CNT_WIDTH-1 downto 0); -- latched at each sector edge
+
+    rotation_timer      : out unsigned(ROT_CNT_WIDTH-1 downto 0);    -- running time in current rotation window
+    rotation_time_out   : out unsigned(ROT_CNT_WIDTH-1 downto 0);    -- latched when 6 sectors complete (full rev)
+    rotation_valid      : out std_logic;                              -- 1 clk pulse when rotation_time_out updated
+
+    partial_rotation_time : out unsigned(ROT_CNT_WIDTH-1 downto 0);  -- latched when direction reverses mid-rotation
+    partial_valid         : out std_logic                              -- 1 clk pulse when partial time is updated
+  );
+end entity;
+
+architecture rtl of bldc_sector_timers is
+
+  ---------------------------------------------------------------------------
+  -- 1) Synchronize asynchronous Hall signals (2-FF sync)
+  ---------------------------------------------------------------------------
+  signal hall_sync1, hall_sync2 : std_logic_vector(2 downto 0);
+
+  ---------------------------------------------------------------------------
+  -- 2) Decode Hall → sector index (0..5) and valid flag
+  --    CW order assumed as: 001 -> 011 -> 010 -> 110 -> 100 -> 101 -> 001
+  --    NOTE: If your wiring is different, adjust the mapping below.
+  ---------------------------------------------------------------------------
+  signal hall_curr      : std_logic_vector(2 downto 0);
+  signal sector_curr    : unsigned(2 downto 0);
+  signal sector_prev    : unsigned(2 downto 0);
+  signal sector_is_valid: std_logic;
+
+  ---------------------------------------------------------------------------
+  -- 3) Detect transitions, direction, and invalid jumps
+  ---------------------------------------------------------------------------
+  signal hall_change        : std_logic;
+  signal dir_curr           : std_logic; -- '1' CW, '0' CCW
+  signal dir_prev           : std_logic;
+  signal have_dir           : std_logic; -- becomes '1' after first valid move
+  signal valid_step         : std_logic; -- '1' if moved by +/-1 sector modulo 6
+  signal reverse_event      : std_logic; -- '1' when direction flips (after have_dir='1')
+
+  ---------------------------------------------------------------------------
+  -- 4) Timers and counters
+  ---------------------------------------------------------------------------
+  signal sector_cnt_run     : unsigned(SECTOR_CNT_WIDTH-1 downto 0);
+  signal sector_cnt_last    : unsigned(SECTOR_CNT_WIDTH-1 downto 0);
+
+  signal rot_cnt_run        : unsigned(ROT_CNT_WIDTH-1 downto 0);
+  signal rot_cnt_out        : unsigned(ROT_CNT_WIDTH-1 downto 0);
+  signal rot_valid_pulse    : std_logic;
+
+  signal partial_rot_time   : unsigned(ROT_CNT_WIDTH-1 downto 0);
+  signal partial_valid_pulse: std_logic;
+
+  signal pos_cnt            : signed(POS_WIDTH-1 downto 0);
+
+  -- count of sectors accumulated toward a full rotation (must be 6 in same direction)
+  signal sectors_in_rotation: unsigned(2 downto 0); -- 0..6
+  signal rotation_active    : std_logic;
+
+  ---------------------------------------------------------------------------
+  -- Helper: modulo arithmetic for direction check
+  ---------------------------------------------------------------------------
+  function is_next_cw(prev_s, curr_s : unsigned(2 downto 0)) return boolean is
+    variable p : integer := to_integer(prev_s);
+    variable c : integer := to_integer(curr_s);
+  begin
+    return ((p + 1) mod 6) = c;
+  end;
+
+  function is_next_ccw(prev_s, curr_s : unsigned(2 downto 0)) return boolean is
+    variable p : integer := to_integer(prev_s);
+    variable c : integer := to_integer(curr_s);
+  begin
+    return ((p + 5) mod 6) = c; -- -1 mod 6
+  end;
+
+begin
+
+  ---------------------------------------------------------------------------
+  -- Sync Halls
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        hall_sync1 <= (others => '0');
+        hall_sync2 <= (others => '0');
+      else
+        hall_sync1 <= hall_in;
+        hall_sync2 <= hall_sync1;
+      end if;
+    end if;
+  end process;
+
+  hall_curr <= hall_sync2;
+
+  ---------------------------------------------------------------------------
+  -- Hall → Sector decode
+  -- Adjust mapping to match your motor’s electrical phase order if needed.
+  ---------------------------------------------------------------------------
+  process(hall_curr)
+  begin
+    sector_is_valid <= '1';
+    case hall_curr is
+      when "001" => sector_curr <= to_unsigned(0,3);
+      when "011" => sector_curr <= to_unsigned(1,3);
+      when "010" => sector_curr <= to_unsigned(2,3);
+      when "110" => sector_curr <= to_unsigned(3,3);
+      when "100" => sector_curr <= to_unsigned(4,3);
+      when "101" => sector_curr <= to_unsigned(5,3);
+      when others =>
+        sector_curr    <= (others => '0');
+        sector_is_valid<= '0';
+    end case;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Edge / transition detect
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        sector_prev <= (others => '0');
+        hall_change <= '0';
+      else
+        -- detect change only when both previous and current are valid
+        if sector_is_valid = '1' then
+          hall_change <= '0';
+          if sector_curr /= sector_prev then
+            hall_change <= '1';
+          end if;
+          sector_prev <= sector_curr;
+        else
+          hall_change <= '0';  -- ignore invalid hall patterns
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Direction logic, valid step, reverse event
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        dir_curr    <= '0';
+        dir_prev    <= '0';
+        have_dir    <= '0';
+        valid_step  <= '0';
+        reverse_event <= '0';
+      else
+        valid_step   <= '0';
+        reverse_event<= '0';
+
+        if hall_change = '1' and sector_is_valid = '1' then
+          if is_next_cw(sector_prev, sector_curr) then
+            dir_curr   <= '1';
+            valid_step <= '1';
+          elsif is_next_ccw(sector_prev, sector_curr) then
+            dir_curr   <= '0';
+            valid_step <= '1';
+          else
+            -- invalid jump (skipped sectors): do not update direction/rotation
+            valid_step <= '0';
+          end if;
+
+          if valid_step = '1' then
+            if have_dir = '0' then
+              have_dir <= '1';
+              dir_prev <= dir_curr;
+            else
+              if dir_curr /= dir_prev then
+                reverse_event <= '1';
+                dir_prev      <= dir_curr;
+              end if;
+            end if;
+          end if;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Sector timer: running count + last value at each (valid) sector edge
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        sector_cnt_run  <= (others => '0');
+        sector_cnt_last <= (others => '0');
+      else
+        sector_cnt_run <= sector_cnt_run + 1;
+
+        if hall_change = '1' and sector_is_valid = '1' and valid_step = '1' then
+          sector_cnt_last <= sector_cnt_run;    -- latch just-finished sector time
+          sector_cnt_run  <= (others => '0');   -- reset for next sector
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Rotation timer:
+  --  * Start when first valid step occurs
+  --  * Accumulate sectors_in_rotation in same direction
+  --  * When sectors_in_rotation = 6 -> latch rotation_time_out (full 360°)
+  --  * If reverse_event -> latch partial_rotation_time and reset accumulators
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        rot_cnt_run         <= (others => '0');
+        rot_cnt_out         <= (others => '0');
+        rot_valid_pulse     <= '0';
+        partial_rot_time    <= (others => '0');
+        partial_valid_pulse <= '0';
+        sectors_in_rotation <= (others => '0');
+        rotation_active     <= '0';
+      else
+        rot_valid_pulse     <= '0';
+        partial_valid_pulse <= '0';
+
+        -- running rotation timer
+        if rotation_active = '1' then
+          rot_cnt_run <= rot_cnt_run + 1;
+        end if;
+
+        if hall_change = '1' and sector_is_valid = '1' and valid_step = '1' then
+          if rotation_active = '0' then
+            -- start accumulating a new rotation window
+            rotation_active     <= '1';
+            rot_cnt_run         <= (others => '0');  -- start from 0 at first edge
+            sectors_in_rotation <= to_unsigned(1, sectors_in_rotation'length);
+          else
+            -- already active; check reversal first
+            if reverse_event = '1' then
+              -- latch partial time and reset rotation window
+              partial_rot_time    <= rot_cnt_run;
+              partial_valid_pulse <= '1';
+              rot_cnt_run         <= (others => '0');
+              sectors_in_rotation <= to_unsigned(1, sectors_in_rotation'length); -- count this new edge as 1
+              -- keep rotation_active = '1' (new window begins now)
+            else
+              -- same direction continues
+              if sectors_in_rotation < to_unsigned(6, sectors_in_rotation'length) then
+                sectors_in_rotation <= sectors_in_rotation + 1;
+              end if;
+
+              -- full revolution achieved when we have 6 valid steps
+              if sectors_in_rotation = to_unsigned(6-1, sectors_in_rotation'length) then
+                rot_cnt_out     <= rot_cnt_run; -- time for 6 sectors
+                rot_valid_pulse <= '1';
+                -- restart window at this edge (continuous measurement)
+                rot_cnt_run         <= (others => '0');
+                sectors_in_rotation <= to_unsigned(1, sectors_in_rotation'length);
+              end if;
+            end if;
+          end if;
+        end if;
+
+        -- if halls go invalid for long, you might optionally timeout rotation_active (not included)
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Position counter (increments CW, decrements CCW) per valid sector edge
+  ---------------------------------------------------------------------------
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if rst_n = '0' then
+        pos_cnt <= (others => '0');
+      else
+        if hall_change = '1' and sector_is_valid = '1' and valid_step = '1' then
+          if dir_curr = '1' then
+            pos_cnt <= pos_cnt + 1;
+          else
+            pos_cnt <= pos_cnt - 1;
+          end if;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ---------------------------------------------------------------------------
+  -- Output assigns
+  ---------------------------------------------------------------------------
+  sector               <= sector_curr;
+  sector_valid         <= sector_is_valid;
+  direction            <= (others => '0') when have_dir='0' else dir_curr; -- undefined until first move, but drive '0'
+  position_count       <= pos_cnt;
+
+  sector_timer         <= sector_cnt_run;
+  last_sector_time     <= sector_cnt_last;
+
+  rotation_timer       <= rot_cnt_run;
+  rotation_time_out    <= rot_cnt_out;
+  rotation_valid       <= rot_valid_pulse;
+
+  partial_rotation_time<= partial_rot_time;
+  partial_valid        <= partial_valid_pulse;
+
+end architecture;
